@@ -27,7 +27,14 @@ CAM_IP = "10.102.100.150"
 CAM_PORT = 554
 CAM_CHANNEL = "102"                     
 RTSP_URL = f"rtsp://{CAM_USERNAME}:{CAM_PASSWORD}@{CAM_IP}:{CAM_PORT}/Streaming/Channels/{CAM_CHANNEL}"
-RTSP_RECONNECT_DELAY = 3.0              
+RTSP_RECONNECT_DELAY = 3.0
+
+# Batasi waktu tunggu koneksi RTSP (mikrodetik) supaya kalau CCTV tidak
+# terjangkau, cepat gagal dan langsung fallback ke webcam, bukan menggantung.
+os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp|stimeout;5000000")
+
+WEBCAM_FALLBACK = True
+WEBCAM_INDEX = 0
 
 DET_SIZE = 320
 REC_INTERVAL = 10
@@ -56,9 +63,12 @@ class CameraStream:
     """Ambil frame dari CCTV (RTSP) di thread sendiri supaya loop utama tidak
     blocking nunggu network/decode, dan otomatis reconnect kalau stream putus."""
 
-    def __init__(self, rtsp_url):
-        self.rtsp_url = rtsp_url
+    def __init__(self, sources):
+        # sources: sumber yang dicoba berurutan, mis. [RTSP_URL, 0].
+        # String dianggap URL RTSP, integer dianggap index webcam lokal.
+        self.sources = list(sources) if isinstance(sources, (list, tuple)) else [sources]
         self.cap = None
+        self.active_source = None
         self.frame = None
         self.running = False
         self.lock = threading.Lock()
@@ -66,9 +76,24 @@ class CameraStream:
         self._open_capture()
 
     def _open_capture(self):
-        self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
-        if self.cap.isOpened():
-            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        for source in self.sources:
+            if isinstance(source, str):
+                cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
+            else:
+                cap = cv2.VideoCapture(source)
+
+            if cap.isOpened():
+                if isinstance(source, str):
+                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                self.cap = cap
+                if source != self.active_source:
+                    label = "RTSP" if isinstance(source, str) else f"webcam #{source}"
+                    print(f"[INFO] Sumber video aktif: {label}")
+                self.active_source = source
+                return
+            cap.release()
+
+        self.cap = None
 
     def is_opened(self):
         return self.cap is not None and self.cap.isOpened()
@@ -639,10 +664,15 @@ def main():
     print(f"[INFO] Terdaftar {len(known_names)} orang dari {len(known_embeddings)} foto.")
 
     print(f"[INFO] Menghubungkan ke CCTV: rtsp://{CAM_USERNAME}:****@{CAM_IP}:{CAM_PORT}/Streaming/Channels/{CAM_CHANNEL}")
-    camera = CameraStream(RTSP_URL)
+
+    sources = [RTSP_URL]
+    if WEBCAM_FALLBACK:
+        sources.append(WEBCAM_INDEX)
+        print(f"[INFO] Fallback ke webcam #{WEBCAM_INDEX} kalau RTSP tidak bisa dibuka.")
+    camera = CameraStream(sources)
 
     if not camera.is_opened():
-        print("[ERROR] Tidak bisa membuka stream RTSP. Cek IP, username, password, port, atau koneksi jaringan.")
+        print("[ERROR] Tidak bisa membuka stream RTSP maupun webcam. Cek IP/kredensial CCTV atau webcam yang terpasang.")
         return
 
     if not camera.start():
